@@ -1,0 +1,21 @@
+# Python & Virtual Env
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+backend/venv/
+.pytest_cache/
+
+# ML Model Weights (Uploaded via GitHub Releases instead)
+*.pt
+*.onnx
+
+# Node / Frontend
+node_modules/
+.next/
+dist/
+build/
+
+# Environment & OS
+.env
+*.DS_Store
