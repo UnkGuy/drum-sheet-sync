@@ -181,6 +181,11 @@ export default function DrumSightReader() {
   const lastClickedBeatRef = useRef<number>(-1);
   const lastScrolledSystemRef = useRef<string>("");
   const measureRefs = useRef<{ [key: number]: SVGGElement | null }>({});
+  const playheadLineRef = useRef<SVGLineElement | null>(null);
+  const measuresRef = useRef<Measure[]>([]);
+  useEffect(() => {
+    measuresRef.current = measures;
+  }, [measures]);
 
   // Load saved charts list on mount
   useEffect(() => {
@@ -315,9 +320,9 @@ export default function DrumSightReader() {
     }
   }, [activeMeasureIdx, autoScrollOn, isPlaying, measures]);
 
-  // Main Sight-Reading Animation & Audio Clock Loop
+// Main Sight-Reading Animation & Audio Clock Loop (Zero 60fps React Re-render Thrashing)
   useEffect(() => {
-    if (!isPlaying || measures.length === 0) {
+    if (!isPlaying || measuresRef.current.length === 0) {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       return;
     }
@@ -325,7 +330,8 @@ export default function DrumSightReader() {
     lastFrameTimeRef.current = performance.now();
 
     const tick = (now: number) => {
-      const dtSeconds = (now - lastFrameTimeRef.current) / 1000;
+      const currentMeasures = measuresRef.current;
+      const dtSeconds = Math.min(0.1, (now - lastFrameTimeRef.current) / 1000);
       lastFrameTimeRef.current = now;
 
       const beatsPerSecond = bpm / 60;
@@ -334,25 +340,24 @@ export default function DrumSightReader() {
       const totalBeatsElapsed = accumulatedBeatsRef.current;
       const wholeBeatIndex = Math.floor(totalBeatsElapsed);
 
+      // 1. Handle 4-Beat Stick Count-In (Only update React state when beat integer changes!)
       if (totalBeatsElapsed < 0) {
         const countBeat = beatsPerBar + wholeBeatIndex + 1;
-        setCountInBeat(countBeat);
         if (wholeBeatIndex !== lastClickedBeatRef.current) {
           lastClickedBeatRef.current = wholeBeatIndex;
+          setCountInBeat(countBeat);
           playMetronomeClick(countBeat === 1, true);
         }
         rafRef.current = requestAnimationFrame(tick);
         return;
       }
 
-      setCountInBeat(null);
-
       const startIdx = loopStartIdx !== null ? loopStartIdx : 0;
-      const endIdx = loopEndIdx !== null ? loopEndIdx : measures.length - 1;
+      const endIdx = loopEndIdx !== null ? loopEndIdx : currentMeasures.length - 1;
 
       let rangeTotalBeats = 0;
       for (let i = startIdx; i <= endIdx; i++) {
-        rangeTotalBeats += (measures[i]?.bars || 1) * beatsPerBar;
+        rangeTotalBeats += (currentMeasures[i]?.bars || 1) * beatsPerBar;
       }
 
       let beatInLoop = totalBeatsElapsed;
@@ -363,7 +368,7 @@ export default function DrumSightReader() {
           lastClickedBeatRef.current = -1;
         } else {
           setIsPlaying(false);
-          setMeasureProgress(0);
+          setCountInBeat(null);
           return;
         }
       }
@@ -374,7 +379,7 @@ export default function DrumSightReader() {
       let measureTotalBeats = beatsPerBar;
 
       for (let i = startIdx; i <= endIdx; i++) {
-        const mBeats = (measures[i]?.bars || 1) * beatsPerBar;
+        const mBeats = (currentMeasures[i]?.bars || 1) * beatsPerBar;
         if (beatInLoop < runningBeats + mBeats) {
           foundIdx = i;
           beatInsideMeasure = beatInLoop - runningBeats;
@@ -384,18 +389,28 @@ export default function DrumSightReader() {
         runningBeats += mBeats;
       }
 
-      setActiveMeasureIdx(foundIdx);
-      setMeasureProgress(beatInsideMeasure / measureTotalBeats);
+      // 2. Move the SVG playhead line directly in the DOM at 60fps (Zero React re-renders!)
+      const activeMeasure = currentMeasures[foundIdx];
+      if (activeMeasure && playheadLineRef.current) {
+        const [x1, , x2] = activeMeasure.box;
+        const progress = beatInsideMeasure / measureTotalBeats;
+        const playheadX = x1 + (x2 - x1) * progress;
+        playheadLineRef.current.setAttribute("x1", String(playheadX));
+        playheadLineRef.current.setAttribute("x2", String(playheadX));
+      }
 
-      const beatInt = Math.floor(beatInsideMeasure);
-      const beatInSingleBar = (beatInt % beatsPerBar) + 1;
-      const barInMulti = Math.floor(beatInt / beatsPerBar) + 1;
-
-      setCurrentBeatInBar(beatInSingleBar);
-      setCurrentBarInMulti(barInMulti);
-
+      // 3. Only trigger React state updates when a new whole beat is crossed (~2-4x per sec)
       if (wholeBeatIndex !== lastClickedBeatRef.current) {
         lastClickedBeatRef.current = wholeBeatIndex;
+        setCountInBeat(null);
+        setActiveMeasureIdx(foundIdx);
+
+        const beatInt = Math.floor(beatInsideMeasure);
+        const beatInSingleBar = (beatInt % beatsPerBar) + 1;
+        const barInMulti = Math.floor(beatInt / beatsPerBar) + 1;
+
+        setCurrentBeatInBar(beatInSingleBar);
+        setCurrentBarInMulti(barInMulti);
         playMetronomeClick(beatInSingleBar === 1, false);
       }
 
@@ -406,7 +421,7 @@ export default function DrumSightReader() {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [isPlaying, bpm, beatsPerBar, measures, loopStartIdx, loopEndIdx, playMetronomeClick]);
+  }, [isPlaying, bpm, beatsPerBar, loopStartIdx, loopEndIdx, playMetronomeClick]);
 
   // Start / Pause Handler
   const togglePlay = useCallback(() => {
@@ -947,7 +962,7 @@ export default function DrumSightReader() {
 
       {/* Giant 4-Beat Count-In Overlay */}
       {countInBeat !== null && (
-        <div className="fixed inset-0 z-40 pointer-events-none flex items-center justify-center bg-black/40 backdrop-blur-xs">
+        <div className="fixed inset-0 z-40 pointer-events-none flex items-center justify-center bg-black/60">
           <div className="bg-zinc-900 border-2 border-amber-400 rounded-2xl px-12 py-8 text-center shadow-2xl">
             <p className="text-xs uppercase tracking-widest text-amber-300 mb-2">Stick Count-In</p>
             <p className="text-7xl font-black text-white">{countInBeat}</p>
@@ -1140,9 +1155,10 @@ export default function DrumSightReader() {
                         {/* Sweeping Vertical Beat Playhead Line */}
                         {isActive && (
                           <line
-                            x1={playheadX}
+                            ref={playheadLineRef}
+                            x1={x1}
                             y1={boxY}
-                            x2={playheadX}
+                            x2={x1}
                             y2={boxY + boxH}
                             stroke="#059669"
                             strokeWidth={4}

@@ -22,29 +22,24 @@ const MODEL_INPUT_SIZE = 1024;
 const CONF_THRESHOLD = 0.45;
 const IOU_THRESHOLD = 0.5;
 
-// Singleton ONNX session so the 43MB model only loads once per browser tab
-let sessionPromise: Promise<ortTypes.InferenceSession> | null = null;
+async function createOrtSession(): Promise<ortTypes.InferenceSession> {
+  const ort = await import("onnxruntime-web");
 
-async function getOrtSession(): Promise<ortTypes.InferenceSession> {
-  if (!sessionPromise) {
-    sessionPromise = (async () => {
-      const ort = await import("onnxruntime-web");
+  ort.env.wasm.wasmPaths = "/ort/";
+  // Use 1 thread so WASM does not duplicate 1024x1024 memory arenas across CPU cores
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy = true;
 
-      // Serve WASM files from /public/ort/ and run inference in a background Web Worker
-      ort.env.wasm.wasmPaths = "/ort/";
-      ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
-      ort.env.wasm.proxy = true; // Offloads session.run() to a Web Worker automatically
+  const modelUrl =
+    process.env.NEXT_PUBLIC_ONNX_MODEL_URL || "/models/best.onnx";
 
-      const modelUrl =
-        process.env.NEXT_PUBLIC_ONNX_MODEL_URL || "/models/best.onnx";
-
-      return await ort.InferenceSession.create(modelUrl, {
-        executionProviders: ["wasm"],
-        graphOptimizationLevel: "all",
-      });
-    })();
-  }
-  return sessionPromise;
+  return await ort.InferenceSession.create(modelUrl, {
+    executionProviders: ["wasm"],
+    graphOptimizationLevel: "all",
+    // CRITICAL FOR LINUX RAM: Prevent ONNX from holding a 2GB memory arena
+    enableCpuMemArena: false,
+    enableMemPattern: false,
+  });
 }
 
 /**
@@ -61,11 +56,11 @@ export async function rasterizeFileToPages(
     const pdfjsLib = await import("pdfjs-dist");
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
-    const arrayBuffer = await file.arrayBuffer();
-    const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const arrayBuffer = await file.arrayBuffer();
+    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+    const pdfDoc = await loadingTask.promise;
     const pages: RenderedPage[] = [];
 
-    // 150 DPI scale factor (PDF standard point unit is 72 DPI)
     const scale = 150 / 72;
 
     for (let i = 1; i <= pdfDoc.numPages; i++) {
@@ -78,23 +73,25 @@ export async function rasterizeFileToPages(
       canvas.height = Math.round(viewport.height);
       const ctx = canvas.getContext("2d")!;
 
-      // Fill white background before rendering PDF strokes
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+      page.cleanup();
 
       pages.push({
         page_number: i,
         width: canvas.width,
         height: canvas.height,
-        image_url: canvas.toDataURL("image/png"),
+        image_url: canvas.toDataURL("image/jpeg", 0.85),
         canvas,
       });
     }
+
+    await pdfDoc.cleanup();
+    await loadingTask.destroy();
     return pages;
   } else {
-    // Standard PNG / JPG upload
     onProgress?.("Loading image...");
     const bitmap = await createImageBitmap(file);
     const canvas = document.createElement("canvas");
@@ -104,13 +101,14 @@ export async function rasterizeFileToPages(
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
 
     return [
       {
         page_number: 1,
         width: canvas.width,
         height: canvas.height,
-        image_url: canvas.toDataURL("image/png"),
+        image_url: canvas.toDataURL("image/jpeg", 0.85),
         canvas,
       },
     ];
@@ -128,47 +126,37 @@ function preprocessCanvas(sourceCanvas: HTMLCanvasElement) {
   const newW = Math.round(origW * scale);
   const newH = Math.round(origH * scale);
 
-  const padX = (MODEL_INPUT_SIZE - newW) / 2;
-  const padY = (MODEL_INPUT_SIZE - newH) / 2;
+  const padX = Math.round((MODEL_INPUT_SIZE - newW) / 2);
+  const padY = Math.round((MODEL_INPUT_SIZE - newH) / 2);
 
   const letterboxCanvas = document.createElement("canvas");
   letterboxCanvas.width = MODEL_INPUT_SIZE;
   letterboxCanvas.height = MODEL_INPUT_SIZE;
   const ctx = letterboxCanvas.getContext("2d")!;
 
-  // Ultralytics standard gray letterbox padding: rgb(114, 114, 114)
   ctx.fillStyle = "rgb(114, 114, 114)";
   ctx.fillRect(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-  ctx.drawImage(
-    sourceCanvas,
-    0,
-    0,
-    origW,
-    origH,
-    Math.round(padX),
-    Math.round(padY),
-    newW,
-    newH
-  );
+  ctx.drawImage(sourceCanvas, 0, 0, origW, origH, padX, padY, newW, newH);
 
   const imgData = ctx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE).data;
+
+  // Free letterbox canvas backing memory immediately
+  letterboxCanvas.width = 0;
+  letterboxCanvas.height = 0;
+
   const numPixels = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
   const float32Data = new Float32Array(3 * numPixels);
 
-  // Convert interleaved RGBA [H, W, 4] to planar RGB [1, 3, H, W] normalized to 0.0 - 1.0
   for (let i = 0; i < numPixels; i++) {
     const rgbaIdx = i * 4;
-    float32Data[i] = imgData[rgbaIdx] / 255.0; // R
-    float32Data[numPixels + i] = imgData[rgbaIdx + 1] / 255.0; // G
-    float32Data[2 * numPixels + i] = imgData[rgbaIdx + 2] / 255.0; // B
+    float32Data[i] = imgData[rgbaIdx] / 255.0;
+    float32Data[numPixels + i] = imgData[rgbaIdx + 1] / 255.0;
+    float32Data[2 * numPixels + i] = imgData[rgbaIdx + 2] / 255.0;
   }
 
-  return { float32Data, scale, padX: Math.round(padX), padY: Math.round(padY), origW, origH };
+  return { float32Data, scale, padX, padY, origW, origH };
 }
 
-/**
- * 3. Compute Intersection-over-Union (IoU) for Non-Maximum Suppression
- */
 function computeIoU(
   boxA: [number, number, number, number],
   boxB: [number, number, number, number]
@@ -181,18 +169,13 @@ function computeIoU(
   const interW = Math.max(0, xB - xA);
   const interH = Math.max(0, yB - yA);
   const interArea = interW * interH;
-
   if (interArea <= 0) return 0;
 
   const areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]);
   const areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]);
-
   return interArea / (areaA + areaB - interArea);
 }
 
-/**
- * 4. Decode YOLOv8 Output Tensor [1, 5, 21504] & Run Greedy NMS
- */
 function postprocessYoloOutput(
   outputData: Float32Array,
   dims: readonly number[],
@@ -203,14 +186,12 @@ function postprocessYoloOutput(
   origH: number,
   pageNumber: number
 ): RawMeasureBox[] {
-  // dims is typically [1, 5, 21504] where 5 = [cx, cy, w, h, conf]
   const numChannels = dims[1];
   const numAnchors = dims[2];
 
   const candidates: { box: [number, number, number, number]; confidence: number }[] = [];
 
   for (let i = 0; i < numAnchors; i++) {
-    // Find max class confidence across channels 4..numChannels-1
     let maxConf = 0;
     for (let c = 4; c < numChannels; c++) {
       const conf = outputData[c * numAnchors + i];
@@ -224,7 +205,6 @@ function postprocessYoloOutput(
     const w = outputData[2 * numAnchors + i];
     const h = outputData[3 * numAnchors + i];
 
-    // Map from 1024x1024 letterbox coordinates back to original page pixel coordinates
     const x1 = Math.max(0, Math.min(origW, (cx - w / 2 - padX) / scale));
     const y1 = Math.max(0, Math.min(origH, (cy - h / 2 - padY) / scale));
     const x2 = Math.max(0, Math.min(origW, (cx + w / 2 - padX) / scale));
@@ -243,7 +223,6 @@ function postprocessYoloOutput(
     }
   }
 
-  // Sort descending by confidence for NMS
   candidates.sort((a, b) => b.confidence - a.confidence);
 
   const kept: RawMeasureBox[] = [];
@@ -275,7 +254,7 @@ function postprocessYoloOutput(
 }
 
 /**
- * 5. Main Entrypoint: End-to-End Browser Detection Pipeline
+ * 5. Main Entrypoint: Runs Inference and Frees 100% of WASM Memory When Done
  */
 export async function detectMeasuresInBrowser(
   file: File,
@@ -285,45 +264,57 @@ export async function detectMeasuresInBrowser(
   const renderedPages = await rasterizeFileToPages(file, onProgress);
 
   onProgress?.("Loading YOLOv8 ONNX model in browser...");
-  const session = await getOrtSession();
+  const session = await createOrtSession();
   const inputName = session.inputNames[0];
   const outputName = session.outputNames[0];
 
   const allRawBoxes: RawMeasureBox[] = [];
 
-  for (let i = 0; i < renderedPages.length; i++) {
-    const page = renderedPages[i];
-    onProgress?.(
-      `Running YOLOv8 Inference on Page ${page.page_number} of ${renderedPages.length}...`
-    );
+  try {
+    for (let i = 0; i < renderedPages.length; i++) {
+      const page = renderedPages[i];
+      onProgress?.(
+        `Running YOLOv8 Inference on Page ${page.page_number} of ${renderedPages.length}...`
+      );
 
-    // Yield to browser event loop so loading status text updates smoothly
-    await new Promise((r) => setTimeout(r, 15));
+      await new Promise((r) => setTimeout(r, 20));
 
-    const { float32Data, scale, padX, padY, origW, origH } = preprocessCanvas(page.canvas);
+      const { float32Data, scale, padX, padY, origW, origH } = preprocessCanvas(page.canvas);
 
-    const inputTensor = new ort.Tensor("float32", float32Data, [
-      1,
-      3,
-      MODEL_INPUT_SIZE,
-      MODEL_INPUT_SIZE,
-    ]);
+      // Free the full-page canvas memory as soon as pixels are extracted
+      page.canvas.width = 0;
+      page.canvas.height = 0;
 
-    const results = await session.run({ [inputName]: inputTensor });
-    const outputTensor = results[outputName];
+      const inputTensor = new ort.Tensor("float32", float32Data, [
+        1,
+        3,
+        MODEL_INPUT_SIZE,
+        MODEL_INPUT_SIZE,
+      ]);
 
-    const pageBoxes = postprocessYoloOutput(
-      outputTensor.data as Float32Array,
-      outputTensor.dims,
-      scale,
-      padX,
-      padY,
-      origW,
-      origH,
-      page.page_number
-    );
+      const results = await session.run({ [inputName]: inputTensor });
+      const outputTensor = results[outputName];
 
-    allRawBoxes.push(...pageBoxes);
+      const pageBoxes = postprocessYoloOutput(
+        outputTensor.data as Float32Array,
+        outputTensor.dims,
+        scale,
+        padX,
+        padY,
+        origW,
+        origH,
+        page.page_number
+      );
+
+      // Explicitly dispose tensors so WASM heap doesn't balloon
+      inputTensor.dispose?.();
+      outputTensor.dispose?.();
+
+      allRawBoxes.push(...pageBoxes);
+    }
+  } finally {
+    // Release the ONNX session & terminate worker so 0 MB is held during playback
+    await session.release();
   }
 
   return {

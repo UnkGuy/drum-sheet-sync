@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "prebuild": "mkdir -p public/models public/ort && cp node_modules/pdfjs-dist/build/pdf.worker.min.mjs public/pdf.worker.min.mjs && cp node_modules/onnxruntime-web/dist/*.wasm public/ort/ 2>/dev/null || true && cp node_modules/onnxruntime-web/dist/*.mjs public/ort/ 2>/dev/null || true && [ -f public/models/best.onnx ] || curl -L https://github.com/YOUR_GITHUB_USERNAME/drum-sheet-sync/releases/download/v0.1.0-alpha/best.onnx -o public/models/best.onnx",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
