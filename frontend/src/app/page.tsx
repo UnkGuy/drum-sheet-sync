@@ -24,6 +24,7 @@ import {
   X,
   Check,
 } from "lucide-react";
+import { detectMeasuresInBrowser } from "@/lib/inference";
 
 interface Measure {
   measure_number: number;
@@ -128,6 +129,9 @@ export default function DrumSightReader() {
   const [pages, setPages] = useState<PageData[]>([]);
   const [measures, setMeasures] = useState<Measure[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState<string>(
+    "Running YOLOv8 Measure Detection & Reading-Order Sort..."
+  );
   const [fileName, setFileName] = useState<string>("");
 
   // Playback & Practice Controls
@@ -216,38 +220,37 @@ export default function DrumSightReader() {
     [metronomeOn]
   );
 
-  // Handle PDF / Image Upload to FastAPI Backend
+  // Handle PDF / Image Upload 100% in Browser (Zero Backend Required)
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setIsLoading(true);
+    setLoadingStatus("Initializing in-browser vision engine...");
     setIsPlaying(false);
     setFileName(file.name.replace(/\.[^/.]+$/, ""));
 
-    const formData = new FormData();
-    formData.append("file", file);
-
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/detect", {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
-      if (data.status === "success") {
-        setPages(data.pages);
-        setMeasures(data.measures);
-        setActiveMeasureIdx(0);
-        setSelectedMeasureIdx(0);
-        setMeasureProgress(0);
-        setLoopStartIdx(null);
-        setLoopEndIdx(null);
-      }
+      const { pages: detectedPages, rawMeasures } = await detectMeasuresInBrowser(
+        file,
+        (statusMsg) => setLoadingStatus(statusMsg)
+      );
+
+      const sortedMeasures = resortMeasuresReadingOrder(rawMeasures);
+
+      setPages(detectedPages);
+      setMeasures(sortedMeasures);
+      setActiveMeasureIdx(0);
+      setSelectedMeasureIdx(0);
+      setMeasureProgress(0);
+      setLoopStartIdx(null);
+      setLoopEndIdx(null);
     } catch (err) {
-      alert("Could not connect to FastAPI backend on port 8000. Make sure uvicorn is running!");
-      console.error(err);
+      console.error("Browser inference failed:", err);
+      alert("Failed to run in-browser ONNX detection. Check console for details.");
     } finally {
       setIsLoading(false);
+      e.target.value = "";
     }
   };
 
